@@ -9,20 +9,50 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      issues: write
       pull-requests: write
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
       - name: Install jq
         run: sudo apt-get update && sudo apt-get install -y jq
 
       - name: Get changed files from PR
         run: |
+          set -euo pipefail
+
           PR_NUM=${{ github.event.pull_request.number }}
-          curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-            "https://api.github.com/repos/${{ github.repository }}/pulls/$PR_NUM/files?per_page=100" \
-            > pr_files.json
-          jq -r '.[].filename' pr_files.json > changed_files.txt
+          PAGE=1
+          : > pr_files.ndjson
+
+          while true; do
+            curl -fsSL \
+              -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${{ github.repository }}/pulls/$PR_NUM/files?per_page=100&page=$PAGE" \
+              > pr_files_page.json
+
+            COUNT=$(jq 'length' pr_files_page.json)
+            if [[ "$COUNT" -eq 0 ]]; then
+              break
+            fi
+
+            jq -c '.[]' pr_files_page.json >> pr_files.ndjson
+
+            if [[ "$COUNT" -lt 100 ]]; then
+              break
+            fi
+
+            PAGE=$((PAGE + 1))
+          done
+
+          if [[ -s pr_files.ndjson ]]; then
+            jq -s '.' pr_files.ndjson > pr_files.json
+          else
+            echo "[]" > pr_files.json
+          fi
+
+          jq -r '.[] | [.filename, .status] | @tsv' pr_files.json > changed_files.tsv
 
       - name: Validate submission rules
         id: validate
@@ -30,23 +60,36 @@ jobs:
           set -euo pipefail
 
           ERROR_MSG=""
-          while IFS= read -r file; do
+          while IFS=$'\t' read -r file status; do
             if [[ "$file" == "README.md" ]]; then
               ERROR_MSG+="❌ 不可修改 README.md\n"
             fi
             if [[ "$file" == "submit/template.py" ]]; then
               ERROR_MSG+="❌ 不可修改 submit/template.py\n"
             fi
-          done < changed_files.txt
+          done < changed_files.tsv
 
-          NEW_FILES=$(grep "^submit/" changed_files.txt || true)
-          NEW_COUNT=$(echo "$NEW_FILES" | grep -c ".*" || true)
+          mapfile -t ADDED_SUBMIT_FILES < <(awk -F'\t' '$2 == "added" && $1 ~ /^submit\//' changed_files.tsv | cut -f1)
+          NEW_COUNT=${#ADDED_SUBMIT_FILES[@]}
+          TOTAL_CHANGED_COUNT=$(awk 'END { print NR }' changed_files.tsv)
+          ADDED_FILE_LIST="無"
+          if [[ $NEW_COUNT -gt 0 ]]; then
+            ADDED_FILE_LIST=$(printf '%s, ' "${ADDED_SUBMIT_FILES[@]}")
+            ADDED_FILE_LIST=${ADDED_FILE_LIST%, }
+          fi
 
           if [[ $NEW_COUNT -ne 1 ]]; then
-            ERROR_MSG+="❌ 你必須只新增一個檔案在 submit/ 目錄中 (目前 $NEW_COUNT 個)\n"
+            ERROR_MSG+="❌ 你必須只新增一個檔案在 submit/ 目錄中 (目前 $NEW_COUNT 個: $ADDED_FILE_LIST)\n"
           else
-            if ! echo "$NEW_FILES" | grep -qE '^submit/W3_[0-9]{9}\.py$'; then
-              ERROR_MSG+="❌ 新增檔名必須符合 W3_(9位數字).py (目前: $NEW_FILES)\n"
+            NEW_FILE="${ADDED_SUBMIT_FILES[0]}"
+            if ! echo "$NEW_FILE" | grep -qE '^submit/W4_[0-9]{9}\.py$'; then
+              ERROR_MSG+="❌ 新增檔名必須符合 W4_(9位數字).py (目前: $NEW_FILE)\n"
+            elif [[ $TOTAL_CHANGED_COUNT -ne 1 ]]; then
+              ERROR_MSG+="❌ 除了 $NEW_FILE 外，不可變更其他檔案\n"
+              ERROR_MSG+="目前變更檔案如下：\n"
+              while IFS=$'\t' read -r file status; do
+                ERROR_MSG+="- $file ($status)\n"
+              done < changed_files.tsv
             fi
           fi
 
@@ -62,6 +105,7 @@ jobs:
           fi
 
       - name: Post feedback comment
+        if: always()
         uses: peter-evans/create-or-update-comment@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
@@ -74,6 +118,7 @@ jobs:
     if: success()  # 只有通過規則才跑 AI
     permissions:
       contents: read
+      issues: write
       pull-requests: write
     steps:
       - uses: actions/checkout@v4
@@ -84,8 +129,11 @@ jobs:
 
       - name: Prepare diff for AI review
         run: |
+          set -euo pipefail
+
           PR_NUM=${{ github.event.pull_request.number }}
-          curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+          curl -fsSL \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
             -H "Accept: application/vnd.github.v3.diff" \
             "https://api.github.com/repos/${{ github.repository }}/pulls/$PR_NUM.diff" \
             > pr_diff.txt
@@ -94,7 +142,14 @@ jobs:
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
-          python3 - <<EOF
+          set -euo pipefail
+
+          if [[ -z "${GEMINI_API_KEY:-}" ]]; then
+            echo "⚠️ GEMINI_API_KEY 尚未設定，已略過 AI Review。" > review_result.md
+            exit 0
+          fi
+
+          python3 - <<'EOF'
           import os
           import google.generativeai as genai
 
@@ -120,9 +175,12 @@ jobs:
           {diff}
           """
 
-          model = genai.GenerativeModel("gemini-1.5-flash")
-          response = model.generate_content(prompt)
-          review = getattr(response, "text", str(response))
+          try:
+              model = genai.GenerativeModel("gemini-2.5-flash")
+              response = model.generate_content(prompt)
+              review = getattr(response, "text", "").strip() or "⚠️ AI 回傳空內容，請稍後重試。"
+          except Exception as exc:
+              review = f"⚠️ AI Review 執行失敗：{exc}"
 
           with open("review_result.md", "w", encoding="utf-8") as f:
               f.write(review)
